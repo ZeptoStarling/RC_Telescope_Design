@@ -10,7 +10,7 @@ class Ray:
         self.origin = np.array(origin)
         self.direction = direction / np.linalg.norm(direction)
     
-def GenerateRays(n, z, D, step_size, offset):
+def GenerateRays(n, z, D, step_size, offset, f_sys):
     """
     Generates n parallel rays distributed within a circular aperture of diameter D at plane z. 
 
@@ -31,9 +31,8 @@ def GenerateRays(n, z, D, step_size, offset):
     filtered_x = xx[mask]
     filtered_y = yy[mask]
     if len(filtered_x) < n:
-        return GenerateRays(n, z, D, step_size * 0.9,offset)
+        return GenerateRays(n, z, D, step_size * 0.9,offset,f_sys)
     
-    global f_sys
     angle = math.atan2(offset,f_sys)
     indices = np.random.choice(len(filtered_x), size=n, replace=False)
     rays = []
@@ -67,20 +66,6 @@ class Mirror():
         nz = 1.0
         N = np.array([nx, ny, nz]) * np.sign(self.R)*-1
         return N / np.linalg.norm(N)
-    
-def CalculateK(f_sys, f_primary, k):
-    """
-    Calculates the conics for the primary and secondary mirrors.
-    
-    #m is secondary magnification - it describes how much the secondary mirror magnifies the image formed by the primary mirror.
-    """
-    m = f_sys / f_primary 
-
-    K_primary = -1.0 - (2.0 * k) / ((1.0 - k) * m**2)
-    K_secondary = -((m + 1.0) / (m - 1.0))**2 - (2.0 * m) / ((1.0 - k) * (m - 1.0)**3)
-
-
-    return K_primary, K_secondary
 
 def ReflectRay(ray, mirror):
     t = (mirror.z - ray.origin[2]) / ray.direction[2]
@@ -95,79 +80,114 @@ def ReflectRay(ray, mirror):
     reflected_dir = Reflection(ray.direction, N)
     return Ray(final_pos, reflected_dir)
 
-def GetPointAtFocalPlane(ray, primary, secondary, sensor_z):
+class Telescope():
+    """ 
+    Models an aplanatic two-mirror telescope. Supports both Ritchey-Chrétien Cassegrain and aplanatic gregorian
+    configurations.
+
+    Args:
+        name (str): Name for the specific configuration (e.g., "Hubble").
+        D (float): Aperture diameter (in mm).
+        f_primary (float): Focal length of the primary mirror (in mm).
+        F_sys (float):  The effective system focal ratio (e.g., 12). 
+                        IMPORTANT! Currently is also used as a toggle to determine 
+                        telescope type (negative vals for Gregorian).
+        s (float, optional): primary-secondary separation (mm)
+        k (float, optional): relative minimum secondary size
+
+    Note:
+        Please provide at least either s or k.
+        The primary mirror of the system is at z = 0.
     """
-    Gets the coordinates where a ray intersects the sensor plane located on the z axis at sensor_z.
-    However, sensor_z gets varied for different offsets, to simulate the curved surface of best focus.
-    """
-    ray_to_sec = ReflectRay(ray, primary)
-    ray_to_focus = ReflectRay(ray_to_sec, secondary)
-    t = (sensor_z-ray_to_focus.origin[2])/ray_to_focus.direction[2]
-    x = ray_to_focus.origin[0] + ray_to_focus.direction[0]*t
-    y = ray_to_focus.origin[1] + ray_to_focus.direction[1]*t
+    def __init__(self, name, D, f_primary, F_sys, *, s=None, k=None):
+        if not s and not k:
+            raise ValueError("You must provide at least either 's' (primary-secondary separation) or 'k' (relative minimum secondary size).")
+        
+        self.name = name
+        self.f_primary = f_primary
+        self.D = D
+        self.F_sys = F_sys
+        
+        if not k:
+            self.k = (f_primary - s) / f_primary
+        else:
+            self.k = k
+        if not s:
+            self.s = f_primary - (k*f_primary)
+        else:
+            self.s = s
+        
+        self.f_sys = self.F_sys * self.D
+        self.m = self.f_sys / self.f_primary
+        self.f_sensor_z = self.s - (self.m * (self.f_primary - self.s)) #"nominal" focal point
+        self.R_primary = self.f_primary*2
+        self.R_secondary = (self.m * self.k * self.R_primary) / (self.m - 1)
+        self.z_primary = 0
+        self.z_secondary = self.s
+        self.eta = (self.m + 1) * self.k - 1
+        self.Rm = ((1 + self.eta) * self.R_primary * self.m**2) / (2 * (self.m + 1) * (self.m**2 - (self.m-1)*self.eta))
+        self.K_primary = -1.0 - (2.0 * self.k) / ((1.0 - self.k) * self.m**2)
+        self.K_secondary = -((self.m + 1.0) / (self.m - 1.0))**2 - (2.0 * self.m) / ((1.0 - self.k) * (self.m - 1.0)**3)
 
-    return x, y
+        print(f"Telescope name: {self.name}")
+        print(f"The conics (K1, K2): {self.K_primary:.6f}, {self.K_secondary:.4f}")
+        print(f"secondary magnification (m): {self.m:.3f}")
+        print(f"relative minimum secondary size (k): {self.k:.3f}")
+        print(f"back focal distance (eta): {self.eta:.4f}")
+        print(f"best image surface curvature radius (Rm): {self.Rm:.2f}")
 
+        self.primary = Mirror(self.R_primary, self.K_primary, self.z_primary)
+        self.secondary = Mirror(self.R_secondary, self.K_secondary, self.z_secondary)
 
+    def GetPointAtFocalPlane(self, ray, sensor_z):
+        """
+        Gets the coordinates where a ray intersects the sensor plane located on the z axis at sensor_z.
+        However, sensor_z gets varied for different offsets, to simulate the curved surface of best focus.
+        """
+        ray_to_sec = ReflectRay(ray, self.primary)
+        ray_to_focus = ReflectRay(ray_to_sec, self.secondary)
+        t = (sensor_z-ray_to_focus.origin[2])/ray_to_focus.direction[2]
+        x = ray_to_focus.origin[0] + ray_to_focus.direction[0]*t
+        y = ray_to_focus.origin[1] + ray_to_focus.direction[1]*t
 
-#Hard-coded parameters for Hubble
-# in mm
-#--------------------
-s = 4906.5 # Primary-Secondary separation
-D = 2400 
-f_primary = 5520 
+        return x, y
 
-F_sys = 24 # Effective system focal ratio
-f_sys = F_sys * D
-#--------------------
-#Derived parameters
-R_primary = f_primary*2
-m = f_sys / f_primary
-print(f"secondary magnification: {m:.3f} | Expected: 10.435")
-f_sensor_z = s - (m * (f_primary - s)) #"nominal" focal point
-k = (f_primary - s) / f_primary
-print(f"relative minimum secondary size: {k:.3f} | Expected: 0.112")
-R_secondary = (m * k * R_primary) / (m - 1)
-z_primary = 0
-z_secondary = s
-eta = (m + 1) * k - 1
-print(f"back focal distance (eta): {eta:.4f} | Expected: 0.2800")
-Rm = ((1 + eta) * R_primary * m**2) / (2 * (m + 1) * (m**2 - (m-1)*eta))
-print(f"best image surface curvature radius (Rm): {Rm:.2f} | Expected: 633.00")
-K_primary, K_secondary = CalculateK(f_sys, f_primary, k)
-print(f"The conics (K1, K2): {K_primary:.6f}, {K_secondary:.4f} | Expected: -1.002300, -1.4970")
+test_telescopes = [
+    {"name": "Hubble",                      "D": 2400, "f_primary": 5520, "F_sys": 24, "s": 4906.5, "k": None},
+    {"name": "f_3_12_aplanatic_Gregorian",  "D": 300,  "f_primary": 900,  "F_sys": -12, "s": None,   "k": -0.417},
+]
 
-#General setup
-n_rays = 100
-offsets = [0, 5, 10, 15]
-fig, axes = plt.subplots(1, 4, figsize=(20, 10))
-axes = axes.flatten()
-ax = 0
-ax_limit = 0.003
+for specs in test_telescopes:
+    n_rays = 100
+    offsets = [0, 5, 10, 15]
+    fig, axes = plt.subplots(1, 4, figsize=(20, 10))
+    axes = axes.flatten()
+    ax = 0
+    ax_limit = 0.01
+    
+    telescope = Telescope(**specs)
+    #Produce spot diagrams
+    for offset in offsets:
+        rays = GenerateRays(100, telescope.s + 1000, telescope.D, 1, offset, telescope.f_sys)
 
-#Produce spot diagrams
-for offset in offsets:
-    rays = GenerateRays(100, s + 1000, D, 1, offset)
-    primary = Mirror(R_primary, K_primary, z_primary)
-    secondary = Mirror(R_secondary, K_secondary, z_secondary)
-    z_curve_shift = (offset**2) / (2 * Rm) #to compensate for field curvature
-    current_f_sensor_z = f_sensor_z + z_curve_shift
+        z_curve_shift = (offset**2) / (2 * telescope.Rm) #to compensate for field curvature
+        current_f_sensor_z = telescope.f_sensor_z + z_curve_shift
 
-    x = []
-    y = []
-    for ray in rays:
-        _x,_y = GetPointAtFocalPlane(ray,primary,secondary,current_f_sensor_z)
-        x.append(_x)
-        y.append(_y)
-    axes[ax].scatter(x, y, s=5, c='red')
-    axes[ax].set_title(f"Offset={offset}mm")
-    axes[ax].set_xlabel("x (mm)")
-    axes[ax].set_ylabel("y (mm)")
-    axes[ax].grid(True)
-    axes[ax].set_xlim(-ax_limit, ax_limit)
-    axes[ax].set_ylim(offset - ax_limit, offset + ax_limit)
-    axes[ax].set_aspect('equal')
-    ax += 1
-plt.tight_layout(pad=4)
-plt.savefig("Hubble_spot_diagram.png")
-plt.show()
+        x = []
+        y = []
+        for ray in rays:
+            _x,_y = telescope.GetPointAtFocalPlane(ray,current_f_sensor_z)
+            x.append(_x)
+            y.append(_y)
+        axes[ax].scatter(x, y, s=5, c='red')
+        axes[ax].set_title(f"Offset={offset}mm")
+        axes[ax].set_xlabel("x (mm)")
+        axes[ax].set_ylabel("y (mm)")
+        axes[ax].grid(True)
+        axes[ax].set_xlim(-ax_limit, ax_limit)
+        axes[ax].set_ylim(offset - ax_limit, offset + ax_limit)
+        axes[ax].set_aspect('equal')
+        ax += 1
+    plt.tight_layout(pad=4)
+    plt.savefig(f"{telescope.name}_spot_diagram.png")
+    plt.show()
